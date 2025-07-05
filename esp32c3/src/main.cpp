@@ -59,7 +59,7 @@ void setupAntiAliasing() {
 // Modern cyberpunk-inspired color palette
 #define COLOR_BG_DARK    0x0841    // Deep dark purple
 #define COLOR_BG_MID     0x1082    // Medium purple-blue
-#define COLOR_ACCENT     0xF81F    // Hot magenta/pink
+#define COLOR_ACCENT     0x07FF    // Hot magenta/pink
 #define COLOR_GPU_MAIN   0x07FF    // Bright cyan
 #define COLOR_CPU_MAIN   0xFFE0    // Bright yellow
 #define COLOR_TEMP_HOT   0xFD20    // Hot orange
@@ -115,16 +115,17 @@ void drawTempText(const char* label, float temp, int x, int y, uint16_t labelCol
   
   if (temp > 0) {
     char tempStr[10];
-    snprintf(tempStr, sizeof(tempStr), "%.0f", temp);
+    snprintf(tempStr, sizeof(tempStr), "%.1f", temp);
     img.setTextColor(tempColor);
     img.drawString(tempStr, x + strlen(label) * 6 + 2, y);
     
     // Draw custom degree symbol
     int degreeX = x + strlen(label) * 6 + 2 + strlen(tempStr) * 6 + 2;
-    drawDegreeSymbol(degreeX, y + 2, tempColor);
+    //drawDegreeSymbol(degreeX, y + 2, tempColor);
     
     // Draw 'C'
-    img.drawString("C", degreeX + 6, y);
+    img.drawString(String((char)247) + "C", degreeX, y);
+
   } else {
     img.setTextColor(COLOR_TEXT_DIM);
     img.drawString("N/A", x + strlen(label) * 6 + 2, y);
@@ -217,7 +218,7 @@ void drawFPSGraph() {
   
   // FPS label
   img.setTextColor(COLOR_FPS_GOOD);
-  img.drawString("FPS", GRAPH_X + GRAPH_WIDTH - 25, GRAPH_Y + 3);
+  //img.drawString("FPS", GRAPH_X + GRAPH_WIDTH - 25, GRAPH_Y + 3);
 }
 
 void readSerialData() {
@@ -289,7 +290,7 @@ void handle_oled() {
     img.drawString("FAN:", 85, startY);
     if (hwData.gpu_fan_speed > 0) {
       char fanStr[10];
-      snprintf(fanStr, sizeof(fanStr), "%.0f", hwData.gpu_fan_speed);
+      snprintf(fanStr, sizeof(fanStr), "%.0fRPM", hwData.gpu_fan_speed);
       uint16_t fanColor = (hwData.gpu_fan_speed > 2000) ? COLOR_TEMP_HOT : COLOR_TEMP_COOL;
       img.setTextColor(fanColor);
       img.drawString(fanStr, 115, startY);
