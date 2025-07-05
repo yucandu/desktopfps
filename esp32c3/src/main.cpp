@@ -85,6 +85,7 @@ struct HardwareData {
   float gpu_temp = -1;
   float fps = -1;
   float gpu_fan_speed = -1;
+  int brightness = 127;
   unsigned long timestamp = 0;
   unsigned long last_update = 0;
   bool data_valid = false;
@@ -96,6 +97,7 @@ HardwareData hwData;
 float fpsHistory[MAX_FPS_SAMPLES];
 int fpsIndex = 0;
 int fpsCount = 0;
+int oldBrightness = 127;
 float minFPS = 0, maxFPS = 60;
 unsigned long lastGraphUpdate = 0;
 
@@ -238,6 +240,7 @@ void readSerialData() {
     hwData.gpu_temp = doc["gpu_temp"].as<float>();
     hwData.fps = doc["fps"].as<float>();
     hwData.gpu_fan_speed = doc["gpu_fan_speed"].as<float>();
+    hwData.brightness = doc["brightness"].as<int>();
     hwData.timestamp = doc["timestamp"].as<unsigned long>();
     hwData.last_update = millis();
     hwData.data_valid = true;
@@ -272,9 +275,12 @@ void handle_oled() {
     img.drawString("WAITING FOR PC DATA", 20, 32);
     img.setTextColor(COLOR_TEXT_DIM);
     img.drawString("Check COM26 connection", 20, 42);
-    digitalWrite(10, LOW);
+    analogWrite(10, 0);
   } else {
-    digitalWrite(10, HIGH);
+    if (hwData.brightness != oldBrightness) {
+      oldBrightness = hwData.brightness;
+      analogWrite(10, hwData.brightness);
+    }
     // Draw the beautiful FPS graph
     drawFPSGraph();
     
