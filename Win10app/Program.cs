@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO.Ports;
 using System.Management;
 using System.Runtime.InteropServices;
@@ -12,60 +12,155 @@ using System.Drawing;
 
 class Program
 {
+    private static volatile bool running = true;
+    private static readonly object dataLock = new object();
+    
+    // Shared data between threads
+    private static float? cpuTemp = null;
+    private static float? gpuTemp = null;
+    private static int? cpuFan = null;
+    private static int? gpuFan = null;
+
     [STAThread]
     static void Main()
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        
         string[] ports = SerialPort.GetPortNames();
         Console.WriteLine("Available COM ports:");
         foreach (string port in ports)
         {
             Console.WriteLine(port);
         }
+        
         NotifyIcon trayIcon = new NotifyIcon();
         trayIcon.Text = "PC Hardware Monitor";
-        trayIcon.Icon = SystemIcons.Information; // You can load a .ico file too
+        trayIcon.Icon = SystemIcons.Information;
         trayIcon.Visible = true;
 
         ContextMenuStrip contextMenu = new ContextMenuStrip();
         ToolStripMenuItem exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (sender, e) => {
+            running = false;
             trayIcon.Visible = false;
             Application.Exit();
         };
         contextMenu.Items.Add(exitItem);
         trayIcon.ContextMenuStrip = contextMenu;
 
-        // Start your loop in a background thread
-        new Thread(() =>
+        // Initialize connections
+        var rtss = new RTSSSharedMemory();
+        bool rtssConnected = rtss.Connect();
+        var serial = new SerialCommunication("COM6", 115200);
+        bool serialConnected = serial.Connect();
+
+        // Start temperature/fan monitoring thread (every 2 seconds)
+        Thread tempThread = new Thread(() => TemperatureMonitoringThread())
         {
-            var rtss = new RTSSSharedMemory();
-            bool rtssConnected = rtss.Connect();
-            var serial = new SerialCommunication("COM6", 115200);
-            bool serialConnected = serial.Connect();
+            IsBackground = true,
+            Name = "TemperatureMonitor"
+        };
+        tempThread.Start();
 
-            while (trayIcon.Visible)
-            {
-                float? cpuTemp = WmiSensors.GetCpuTemp();
-                float? gpuTemp = WmiSensors.GetGpuTemp();
-                int? cpuFan = WmiSensors.GetCpuFanSpeed();
-                int? gpuFan = WmiSensors.GetGpuFanSpeed();
-
-                string activeProc = rtss.GetActiveWindowProcess();
-                float? fps = rtssConnected && !string.IsNullOrEmpty(activeProc)
-                    ? rtss.ReadFpsForProcess(activeProc)
-                    : null;
-
-                if (serialConnected)
-                    serial.SendData(cpuTemp, gpuTemp, fps, gpuFan);
-
-                Thread.Sleep(100);
-            }
-        }).Start();
+        // Start FPS monitoring + serial transmission thread (10 Hz = 100ms)
+        Thread fpsSerialThread = new Thread(() => FpsAndSerialThread(rtss, rtssConnected, serial, serialConnected, trayIcon))
+        {
+            IsBackground = true,
+            Name = "FpsAndSerial"
+        };
+        fpsSerialThread.Start();
 
         // Run the tray application
         Application.Run();
+        
+        // Cleanup
+        running = false;
+        rtss.Disconnect();
+        serial.Disconnect();
+    }
+
+    private static void TemperatureMonitoringThread()
+    {
+        Console.WriteLine("Started temperature monitoring thread (2s interval)");
+        while (running)
+        {
+            try
+            {
+                float? newCpuTemp = WmiSensors.GetCpuTemp();
+                float? newGpuTemp = WmiSensors.GetGpuTemp();
+                int? newCpuFan = WmiSensors.GetCpuFanSpeed();
+                int? newGpuFan = WmiSensors.GetGpuFanSpeed();
+
+                lock (dataLock)
+                {
+                    cpuTemp = newCpuTemp;
+                    gpuTemp = newGpuTemp;
+                    cpuFan = newCpuFan;
+                    gpuFan = newGpuFan;
+                }
+
+                // Temperature data updated silently
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in temperature thread: {ex.Message}");
+            }
+
+            Thread.Sleep(2000); // 2 seconds
+        }
+        Console.WriteLine("Temperature monitoring thread stopped");
+    }
+
+    private static void FpsAndSerialThread(RTSSSharedMemory rtss, bool rtssConnected, SerialCommunication serial, bool serialConnected, NotifyIcon trayIcon)
+    {
+        Console.WriteLine("Started FPS + serial thread (10Hz = 100ms interval)");
+        while (running)
+        {
+            try
+            {
+                // Get current FPS
+                string activeProcess = rtss.GetActiveWindowProcess();
+                float? fps = rtssConnected && !string.IsNullOrEmpty(activeProcess)
+                    ? rtss.ReadFpsForProcess(activeProcess)
+                    : null;
+
+                // Get current temperature/fan snapshot
+                float? currentCpuTemp, currentGpuTemp;
+                int? currentCpuFan, currentGpuFan;
+                
+                lock (dataLock)
+                {
+                    currentCpuTemp = cpuTemp;
+                    currentGpuTemp = gpuTemp;
+                    currentCpuFan = cpuFan;
+                    currentGpuFan = gpuFan;
+                }
+
+                // Send data via serial
+                if (serialConnected)
+                {
+                    bool sendResult = serial.SendData(currentCpuTemp, currentGpuTemp, fps, currentGpuFan);
+                    if (!sendResult)
+                    {
+                        Console.WriteLine("Serial connection failed. Shutting down...");
+                        running = false;
+                        trayIcon.Visible = false;
+                        Application.Exit();
+                        break;
+                    }
+                }
+
+                // FPS data updated silently
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in FPS+serial thread: {ex.Message}");
+            }
+
+            Thread.Sleep(100); // 100ms = 10 Hz
+        }
+        Console.WriteLine("FPS + serial thread stopped");
     }
 }
 
@@ -276,26 +371,26 @@ static class WmiSensors
         return null;
     }
     
-public static void DebugPrintAllFanSensors()
-{
-    try
+    public static void DebugPrintAllFanSensors()
     {
-        var searcher = new ManagementObjectSearcher(@"root\LibreHardwareMonitor", "SELECT * FROM Sensor WHERE SensorType='Fan'");
-        foreach (ManagementObject obj in searcher.Get())
+        try
         {
-            string name = obj["Name"]?.ToString() ?? "";
-            string id = obj["Identifier"]?.ToString() ?? "";
-            var val = obj["Value"];
-            Console.WriteLine($"Fan Sensor: '{name}' (ID: {id}), Value: {val}");
+            var searcher = new ManagementObjectSearcher(@"root\LibreHardwareMonitor", "SELECT * FROM Sensor WHERE SensorType='Fan'");
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                string name = obj["Name"]?.ToString() ?? "";
+                string id = obj["Identifier"]?.ToString() ?? "";
+                var val = obj["Value"];
+                Console.WriteLine($"Fan Sensor: '{name}' (ID: {id}), Value: {val}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error reading fan sensors: " + ex.Message);
         }
     }
-    catch (Exception ex)
-    {
-        Console.WriteLine("Error reading fan sensors: " + ex.Message);
-    }
-}
 
-public static int? GetGpuFanSpeed()
+    public static int? GetGpuFanSpeed()
     {
         try
         {
