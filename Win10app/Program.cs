@@ -20,6 +20,7 @@ class Program
     private static float? gpuTemp = null;
     private static int? cpuFan = null;
     private static int? gpuFan = null;
+    private static float? cpuLoad = null;
     private static int brightnessValue = 128; // Default brightness (0-255)
 
     // GUI and communication objects
@@ -130,11 +131,13 @@ class Program
             {
                 float? newCpuTemp = WmiSensors.GetCpuTemp();
                 float? newGpuTemp = WmiSensors.GetGpuTemp();
+                float? newCpuLoad = WmiSensors.GetCpuLoad();
                 int? newCpuFan = WmiSensors.GetCpuFanSpeed();
                 int? newGpuFan = WmiSensors.GetGpuFanSpeed();
 
                 lock (dataLock)
                 {
+                    cpuLoad = newCpuLoad;
                     cpuTemp = newCpuTemp;
                     gpuTemp = newGpuTemp;
                     cpuFan = newCpuFan;
@@ -154,7 +157,7 @@ class Program
                 Console.WriteLine($"Error in temperature thread: {ex.Message}");
             }
 
-            Thread.Sleep(2000); // 2 seconds
+            Thread.Sleep(1000); // 1 second
         }
         Console.WriteLine("Temperature monitoring thread stopped");
     }
@@ -175,6 +178,9 @@ class Program
                 // Get current temperature/fan/brightness snapshot
                 float? currentCpuTemp, currentGpuTemp;
                 int? currentCpuFan, currentGpuFan;
+                float? currentCpuLoad;
+
+
                 int currentBrightness;
                 
                 lock (dataLock)
@@ -183,13 +189,15 @@ class Program
                     currentGpuTemp = gpuTemp;
                     currentCpuFan = cpuFan;
                     currentGpuFan = gpuFan;
+                    currentCpuLoad = cpuLoad;
                     currentBrightness = brightnessValue;
                 }
 
                 // Send data via serial
                 if (serialConnected && serial != null)
                 {
-                    bool sendResult = serial.SendData(currentCpuTemp, currentGpuTemp, fps, currentGpuFan, currentBrightness);
+                    bool sendResult = serial.SendData(currentCpuTemp, currentGpuTemp, fps, currentGpuFan, currentBrightness, currentCpuLoad);
+
                     if (!sendResult)
                     {
                         Console.WriteLine("Serial connection failed. Disconnecting...");
@@ -379,7 +387,7 @@ public partial class MainForm : Form
         }
 
         string selectedPort = comPortComboBox.SelectedItem.ToString();
-        bool connected = OnConnectRequested?.Invoke(selectedPort, 115200) ?? false;
+        bool connected = OnConnectRequested?.Invoke(selectedPort, 256000) ?? false;
         
         UpdateConnectionStatus(connected);
     }
@@ -566,7 +574,7 @@ class SerialCommunication
             return false;
         }
     }
-    public bool SendData(float? cpuTemp, float? gpuTemp, float? fps, int? gpuFan, int brightness)
+    public bool SendData(float? cpuTemp, float? gpuTemp, float? fps, int? gpuFan, int brightness, float? cpuLoad)
     {
         try
         {
@@ -577,6 +585,7 @@ class SerialCommunication
                 fps = fps ?? -1,
                 gpu_fan_speed = gpuFan ?? -1,
                 brightness = brightness,
+                cpu_load = cpuLoad ?? -1,
                 timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
             };
             string json = JsonSerializer.Serialize(data) + "\n";
@@ -599,6 +608,26 @@ class SerialCommunication
 // --- WMI Sensors ---
 static class WmiSensors
 {
+    public static float? GetCpuLoad()
+    {
+        try
+        {
+            var searcher = new ManagementObjectSearcher(@"root\LibreHardwareMonitor", "SELECT * FROM Sensor WHERE SensorType='Load'");
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                string name = obj["Name"]?.ToString() ?? "";
+                if (name.Equals("CPU Total", StringComparison.OrdinalIgnoreCase))
+                {
+                    var val = obj["Value"];
+                    if (val != null && float.TryParse(val.ToString(), out float load) && load >= 0)
+                        return load;
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
     public static float? GetCpuTemp()
     {
         try
