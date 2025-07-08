@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 
+ bool dataExpired;
 char auth[] = "8gJkMOvx8u5vKCVbjsAheg-gL9mp64Cg";
 const char* ssid = "mikesnet";
 const char* password = "springchicken";
@@ -89,7 +90,7 @@ void setupAntiAliasing() {
 #define GRAPH_HEIGHT  45
 #define GRAPH_X       2
 #define GRAPH_Y       2
-#define MAX_FPS_SAMPLES 160  // More samples for smoother graph
+#define MAX_FPS_SAMPLES 320  // More samples for smoother graph
 #define GRAPH_UPDATE_INTERVAL 40
 
 struct HardwareData {
@@ -319,36 +320,77 @@ void drawFPSGraph() {
 }
 
 void readSerialData() {
-  String jsonString = Serial.readStringUntil('\n');
+  static String buffer;
+  static unsigned long lastSerialActivity = 0;
+  static bool wasDisconnected = false;
   
-  if (jsonString.length() > 0) {
-    DynamicJsonDocument doc(512);
-    DeserializationError error = deserializeJson(doc, jsonString);
-    
-    if (error) {
-      Serial.print("JSON parsing failed: ");
-      Serial.println(error.c_str());
-      return;
+  // Check if we were disconnected and are now getting data
+  if (Serial.available() && (dataExpired || !hwData.data_valid)) {
+    if (!wasDisconnected) {
+      // We're reconnecting - flush the serial buffer to prevent corruption
+      while (Serial.available()) {
+        Serial.read();  // Discard everything
+      }
+      buffer = "";  // Clear our buffer too
+      wasDisconnected = true;
+      
+      // Force backlight on immediately to show we're reconnecting
+      analogWrite(10, 127);  // Default brightness
+      
+      delay(100);  // Give PC time to start sending fresh data
+      return;  // Skip processing this cycle
     }
-    
-    hwData.cpu_temp = doc["cpu_temp"].as<float>();
-    hwData.gpu_temp = doc["gpu_temp"].as<float>();
-    hwData.fps = doc["fps"].as<float>();
-    hwData.gpu_fan_speed = doc["gpu_fan_speed"].as<float>();
-    hwData.brightness = doc["brightness"].as<int>();
-    hwData.cpu_load = doc["cpu_load"].as<float>();
-    hwData.timestamp = doc["timestamp"].as<unsigned long>();
-    hwData.last_update = millis();
-    hwData.data_valid = true;
-    
-    if (millis() - lastGraphUpdate >= GRAPH_UPDATE_INTERVAL) {
-      addFPSData(hwData.fps);
-      addCPUUsageData(hwData.cpu_load);
-      lastGraphUpdate = millis();
+  }
+  
+  // Reset disconnected flag when we have valid data
+  if (hwData.data_valid && !dataExpired) {
+    wasDisconnected = false;
+  }
+  
+  // Check if we're receiving serial data (indicates reconnection)
+  if (Serial.available()) {
+    lastSerialActivity = millis();
+  }
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      // End of JSON string — parse it
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, buffer);
+
+      if (!error) {
+        hwData.cpu_temp = doc["cpu_temp"] | -1.0f;
+        hwData.gpu_temp = doc["gpu_temp"] | -1.0f;
+        hwData.fps = doc["fps"] | -1.0f;
+        hwData.gpu_fan_speed = doc["gpu_fan_speed"] | -1.0f;
+        hwData.brightness = doc["brightness"] | 127;
+        hwData.cpu_load = doc["cpu_load"] | -1.0f;
+        hwData.timestamp = doc["timestamp"] | 0UL;
+        hwData.last_update = millis();
+        hwData.data_valid = true;
+
+        if (millis() - lastGraphUpdate >= GRAPH_UPDATE_INTERVAL) {
+          addFPSData(hwData.fps);
+          addCPUUsageData(hwData.cpu_load);
+          lastGraphUpdate = millis();
+        }
+      } else {
+        // JSON parsing failed - but we're still connected, so keep trying
+        Serial.print("JSON Parse Error: ");
+        Serial.println(error.c_str());
+      }
+
+      // Reset the buffer
+      buffer = "";
+    } else if (isPrintable(c)) {
+      buffer += c;
+      // Prevent runaway buffer growth
+      if (buffer.length() > 512) {
+        buffer = "";  // reset on overflow
+      }
     }
-    
-    Serial.printf("Received - CPU: %.1f°C, GPU: %.1f°C, FPS: %.1f\n", 
-                  hwData.cpu_temp, hwData.gpu_temp, hwData.fps);
   }
 }
 
@@ -363,21 +405,34 @@ void handle_oled() {
     img.drawLine(0, i, 160, i, color);
   }
   
-  bool dataExpired = (millis() - hwData.last_update) > DATA_TIMEOUT;
+  dataExpired = (millis() - hwData.last_update) > DATA_TIMEOUT;
   
   if (!hwData.data_valid || dataExpired) {
     // Stylish error display
     img.fillRoundRect(10, 25, 140, 30, 8, COLOR_ACCENT);
     img.setTextColor(COLOR_TEXT_MAIN);
-    img.drawString("WAITING FOR PC DATA", 20, 32);
+    
+    // Show different messages based on state
+    if (Serial.available() > 0) {
+      img.drawString("RECONNECTING...", 30, 32);
+    } else {
+      img.drawString("WAITING FOR PC DATA", 20, 32);
+    }
+    
     img.setTextColor(COLOR_TEXT_DIM);
     img.drawString("Check COM26 connection", 20, 42);
-    analogWrite(10, 0);
+    
+    // Only turn off backlight if we're truly disconnected (no serial activity)
+    if (dataExpired && !Serial.available()) {
+      analogWrite(10, 0);
+    }
   } else {
+    // Ensure backlight is on when we have valid data
     if (hwData.brightness != oldBrightness) {
       oldBrightness = hwData.brightness;
       analogWrite(10, hwData.brightness);
     }
+    
     // Draw the beautiful FPS graph
     if (hwData.fps >= 0)
       drawFPSGraph();
@@ -430,7 +485,9 @@ void handle_oled() {
 }
 
 void setup() {
-  Serial.begin(256000);
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(0); 
+  Serial.setRxBufferSize(512);
   WiFi.begin(ssid, password);
   delay(10);
   pinMode(10, OUTPUT);
@@ -442,6 +499,7 @@ void setup() {
   tft.fillScreen(COLOR_BG_DARK);
   
   img.createSprite(160, 80);
+  img.setColorDepth(8);
   img.fillSprite(COLOR_BG_DARK);
   img.setTextColor(COLOR_TEXT_MAIN);
   img.setTextSize(1);
@@ -471,16 +529,15 @@ void loop() {
     
     Blynk.config(auth, IPAddress(192, 168, 50, 197), 8080);
     Blynk.connect();
-    Serial.println("OTA Ready");
     otaStarted = true;
   }
-  if (otaStarted) {
+  else if (otaStarted && WiFi.status() == WL_CONNECTED) {
     ArduinoOTA.handle();
     Blynk.run();
   }
 
   every(30000) {
-    if (otaStarted) {
+    if (otaStarted && !dataExpired) {
       Blynk.virtualWrite(V0, hwData.cpu_temp);
       Blynk.virtualWrite(V1, hwData.gpu_temp);
       Blynk.virtualWrite(V2, hwData.fps);
@@ -491,5 +548,5 @@ void loop() {
   }
 
   handle_oled();
-  //delay(40);
+  delay(10);
 }
