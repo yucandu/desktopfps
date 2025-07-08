@@ -22,6 +22,8 @@ class Program
     private static int? gpuFan = null;
     private static float? cpuLoad = null;
     private static int brightnessValue = 128; // Default brightness (0-255)
+    private static string lastConnectedPort = null;
+
 
     // GUI and communication objects
     private static MainForm mainForm;
@@ -29,6 +31,8 @@ class Program
     private static RTSSSharedMemory rtss;
     private static bool rtssConnected = false;
     private static bool serialConnected = false;
+
+    private static NotifyIcon trayIcon;
 
     [STAThread]
     static void Main()
@@ -40,7 +44,7 @@ class Program
         mainForm = new MainForm();
         
         // Set up system tray
-        NotifyIcon trayIcon = new NotifyIcon();
+        trayIcon = new NotifyIcon();
         trayIcon.Text = "PC Hardware Monitor";
         trayIcon.Icon = SystemIcons.Information;
         trayIcon.Visible = true;
@@ -76,16 +80,39 @@ class Program
         rtssConnected = rtss.Connect();
 
         // Set up event handlers for the main form
-        mainForm.OnConnectRequested += (port, baud) => {
+        mainForm.OnConnectRequested += (port, baud) =>
+        {
             if (serial != null)
             {
                 serial.Disconnect();
             }
+
+            if (string.IsNullOrEmpty(port))
+            {
+                serialConnected = false;
+                ShowTrayMessage("Disconnected", "Serial connection closed.", ToolTipIcon.Info); // <== add this
+                return false; // Disconnect request
+            }
+
             serial = new SerialCommunication(port, baud);
             serialConnected = serial.Connect();
-            mainForm.UpdateConnectionStatus(serialConnected);
+            if (serialConnected)
+            {
+                lastConnectedPort = port;
+                mainForm.UpdateConnectionStatus(true);
+                mainForm.Hide(); // << hide window after successful connection
+                ShowTrayMessage("Connected", $"Connected to {port}", ToolTipIcon.Info);
+            }
+            else
+            {
+                mainForm.UpdateConnectionStatus(false);
+                ShowTrayMessage("Connect Failed", "Could not connect to COM port.", ToolTipIcon.Warning);
+
+            }
+
             return serialConnected;
         };
+
 
         mainForm.OnBrightnessChanged += (value) => {
             lock (dataLock)
@@ -109,7 +136,24 @@ class Program
             Name = "FpsAndSerial"
         };
         fpsSerialThread.Start();
+        string[] ports = SerialPort.GetPortNames()
+            .Where(p => !p.Equals("COM1", StringComparison.OrdinalIgnoreCase) && !p.Equals("COM19", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
 
+        if (ports.Length > 0)
+        {
+            string port = ports[0];
+            serial = new SerialCommunication(port, 115200);
+            serialConnected = serial.Connect();
+            if (serialConnected)
+            {
+                lastConnectedPort = port;
+                mainForm.UpdateConnectionStatus(true);
+                mainForm.SetPortSelection(port);
+                ShowTrayMessage("Auto-Connected", $"Connected to {port}", ToolTipIcon.Info);
+            }
+            else {ShowTrayMessage("Auto-Connect Failed", "Could not connect to any COM port.", ToolTipIcon.Warning);}
+        }
         // Show the main form initially
         mainForm.Show();
 
@@ -121,6 +165,17 @@ class Program
         rtss?.Disconnect();
         serial?.Disconnect();
     }
+    private static void ShowTrayMessage(string title, string message, ToolTipIcon icon = ToolTipIcon.Info)
+    {
+        if (trayIcon != null)
+        {
+            trayIcon.BalloonTipTitle = title;
+            trayIcon.BalloonTipText = message;
+            trayIcon.BalloonTipIcon = icon;
+            trayIcon.ShowBalloonTip(3000); // Show for 3 seconds
+        }
+    }
+
 
     private static void TemperatureMonitoringThread()
     {
@@ -147,7 +202,8 @@ class Program
                 // Update GUI with new values
                 if (mainForm != null && !mainForm.IsDisposed)
                 {
-                    mainForm.BeginInvoke(new Action(() => {
+                    mainForm.BeginInvoke(new Action(() =>
+                    {
                         mainForm.UpdateSensorValues(newCpuTemp, newGpuTemp, newCpuFan, newGpuFan);
                     }));
                 }
@@ -202,11 +258,24 @@ class Program
                     {
                         Console.WriteLine("Serial connection failed. Disconnecting...");
                         serialConnected = false;
-                        if (mainForm != null && !mainForm.IsDisposed)
+                        serial?.Disconnect();
+
+                        if (lastConnectedPort != null)
                         {
-                            mainForm.BeginInvoke(new Action(() => {
-                                mainForm.UpdateConnectionStatus(false);
-                            }));
+                            Console.WriteLine($"Attempting to reconnect to {lastConnectedPort}...");
+                            Thread.Sleep(1000);
+                            serial = new SerialCommunication(lastConnectedPort, 115200);
+                            serialConnected = serial.Connect();
+                            if (mainForm != null && !mainForm.IsDisposed)
+                            {
+                                mainForm.BeginInvoke(new Action(() =>
+                                {
+                                    mainForm.UpdateConnectionStatus(serialConnected);
+                                    if (serialConnected)
+                                    ShowTrayMessage("Reconnected", $"Reconnected to {lastConnectedPort}", ToolTipIcon.Info);
+
+                                }));
+                            }
                         }
                     }
                 }
@@ -252,6 +321,26 @@ public partial class MainForm : Form
         InitializeComponent();
         LoadAvailablePorts();
     }
+    
+    public void SetPortSelection(string portName)
+    {
+        if (this.InvokeRequired)
+        {
+            this.Invoke(new Action<string>(SetPortSelection), portName);
+            return;
+        }
+
+        if (comPortComboBox.Items.Contains(portName))
+        {
+            comPortComboBox.SelectedItem = portName;
+        }
+        else
+        {
+            comPortComboBox.Items.Add(portName);
+            comPortComboBox.SelectedItem = portName;
+        }
+    }
+
 
     private void InitializeComponent()
     {
@@ -264,10 +353,19 @@ public partial class MainForm : Form
         this.ShowInTaskbar = false;
 
         // Override the form closing behavior
-        this.FormClosing += (sender, e) => {
+        this.FormClosing += (sender, e) =>
+        {
             if (e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
+                this.Hide();
+            }
+        };
+
+        this.Resize += (sender, e) =>
+        {
+            if (this.WindowState == FormWindowState.Minimized)
+            {
                 this.Hide();
             }
         };
@@ -300,6 +398,16 @@ public partial class MainForm : Form
         connectButton.Size = new Size(80, 25);
         connectButton.Click += ConnectButton_Click;
         this.Controls.Add(connectButton);
+
+        var disconnectButton = new Button();
+        disconnectButton.Text = "Disconnect";
+        disconnectButton.Location = new Point(280, 45);
+        disconnectButton.Size = new Size(80, 25);
+        disconnectButton.Click += (sender, e) => {
+            OnConnectRequested?.Invoke(null, 0);  // Interpret null as a disconnect signal
+            UpdateConnectionStatus(false);
+        };
+        this.Controls.Add(disconnectButton);
 
         // Connection status
         connectionStatusLabel = new Label();
@@ -387,7 +495,7 @@ public partial class MainForm : Form
         }
 
         string selectedPort = comPortComboBox.SelectedItem.ToString();
-        bool connected = OnConnectRequested?.Invoke(selectedPort, 256000) ?? false;
+        bool connected = OnConnectRequested?.Invoke(selectedPort, 115200) ?? false;
         
         UpdateConnectionStatus(connected);
     }
@@ -411,6 +519,9 @@ public partial class MainForm : Form
         connectionStatusLabel.ForeColor = connected ? Color.Green : Color.Red;
         connectButton.Enabled = !connected;
         comPortComboBox.Enabled = !connected;
+        var disconnectButton = this.Controls.OfType<Button>().FirstOrDefault(b => b.Text == "Disconnect");
+        if (disconnectButton != null)
+            disconnectButton.Enabled = connected;
     }
 
     public void UpdateSensorValues(float? cpuTemp, float? gpuTemp, int? cpuFan, int? gpuFan)
